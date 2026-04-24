@@ -16,7 +16,7 @@ const VECTORSTORE_PATH = process.env.VECTORSTORE_PATH ||
 
 // HuggingFace embedding model (same as ingest.js)
 const HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_EMBED_URL   = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_EMBED_MODEL}`;
+const HF_EMBED_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction";
 
 // ── Load vector store once at startup ────────────────────────────────────────
 let vectorStore = null;
@@ -248,3 +248,5 @@ router.get("/chat/status", (req, res) => {
 });
 
 module.exports = router;
+
+
