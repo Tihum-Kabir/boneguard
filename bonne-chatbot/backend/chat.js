@@ -1,6 +1,7 @@
 // =============================================================================
-// backend/chat.js — Bonne v2
-// Groq for generation · Gemini for embeddings · Mode-aware responses
+// backend/chat.js — Bonne v3
+// HuggingFace embeddings + Groq generation
+// No Gemini dependency — zero 403 errors
 // =============================================================================
 
 const express  = require("express");
@@ -8,10 +9,14 @@ const fs       = require("fs");
 const path     = require("path");
 const router   = express.Router();
 
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;
+const HF_TOKEN         = process.env.HF_TOKEN;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const VECTORSTORE_PATH = process.env.VECTORSTORE_PATH ||
   path.join(__dirname, "../data/vectorstore.json");
+
+// HuggingFace embedding model (same as ingest.js)
+const HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const HF_EMBED_URL   = `https://api-inference.huggingface.co/pipeline/feature-extraction/${HF_EMBED_MODEL}`;
 
 // ── Load vector store once at startup ────────────────────────────────────────
 let vectorStore = null;
@@ -23,7 +28,7 @@ function loadVectorStore() {
     return null;
   }
   vectorStore = JSON.parse(fs.readFileSync(VECTORSTORE_PATH, "utf-8"));
-  console.log(`[BONNE] Vector store loaded: ${vectorStore.chunks} chunks`);
+  console.log(`[BONNE] Vector store loaded: ${vectorStore.chunks} chunks | model: ${vectorStore.model}`);
   return vectorStore;
 }
 
@@ -40,22 +45,28 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// ── Embed query using Gemini ──────────────────────────────────────────────────
+// ── Embed query using HuggingFace ─────────────────────────────────────────────
 async function embedQuery(text) {
   const fetch = require("node-fetch");
-  const url   = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${GEMINI_API_KEY}`;
-  const res   = await fetch(url, {
+  const res   = await fetch(HF_EMBED_URL, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Authorization": `Bearer ${HF_TOKEN}`,
+      "Content-Type":  "application/json",
+    },
     body: JSON.stringify({
-      model:    "models/gemini-embedding-001",
-      content:  { parts: [{ text }] },
-      taskType: "RETRIEVAL_QUERY",
+      inputs:  [text],
+      options: { wait_for_model: true },
     }),
   });
-  if (!res.ok) throw new Error(`Gemini embed error: ${res.status}`);
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`HF embed error ${res.status}: ${err}`);
+  }
+
   const data = await res.json();
-  return data.embedding.values;
+  return data[0]; // first (and only) embedding
 }
 
 // ── Retrieve top-k chunks ────────────────────────────────────────────────────
@@ -112,51 +123,43 @@ function buildSystemPrompt(retrievedChunks, mode = "clinical") {
     .map((c, i) => `[Context ${i + 1}]\n${c.content}`)
     .join("\n\n");
 
-  // Base identity
   const base = `You are Bonne, a compassionate and highly knowledgeable clinical AI assistant specialising in bone metastasis. You help patients, their families, and healthcare providers.
 
 RESPONSE FORMAT RULES — ALWAYS FOLLOW:
-- Keep answers SHORT and PRECISE — maximum 150 words unless the topic truly requires more.
-- Use markdown formatting: **bold** for key terms, bullet points for lists, short paragraphs.
+- Keep answers SHORT and PRECISE — maximum 150 words unless truly required.
+- Use markdown formatting: **bold** for key terms, bullet points for lists.
 - Never copy-paste from documents. Always rephrase in your own clear, warm language.
-- If the question is unrelated to bone metastasis or oncology, say: "I'm Bonne — I can only help with bone metastasis topics. Please ask me something related."
-- Never reveal you are powered by Groq, LLaMA, or Gemini. You are Bonne.
+- If the question is unrelated to bone metastasis or oncology, say: "I'm Bonne — I can only help with bone metastasis topics."
+- Never reveal you are powered by Groq, LLaMA, or HuggingFace. You are Bonne.
 - Always end with one short actionable sentence or encouragement.
 
 MEDICAL CONTEXT FROM DOCUMENTS:
 ${context}`;
 
-  // Mode-specific personality
   const modes = {
     clinical: `
 CURRENT MODE: Clinical Information
 - Be precise, medically accurate, and evidence-based.
-- Explain medical terms simply after using them.
-- Focus on facts, mechanisms, and statistics from the context.`,
+- Explain medical terms simply after using them.`,
 
     motivational: `
 CURRENT MODE: Emotional Support & Motivation
 - Be warm, empathetic, and deeply human.
 - Acknowledge the patient's feelings first before giving information.
-- Remind them they are not alone and that many patients live fulfilling lives with bone metastasis.
-- Offer genuine encouragement without being dismissive of their fears.
-- If distress seems severe, gently suggest speaking with a counsellor or palliative care team.
-- Share brief stories of resilience when relevant.`,
+- Remind them they are not alone.
+- If distress seems severe, gently suggest speaking with a counsellor or palliative care team.`,
 
     treatment: `
 CURRENT MODE: Treatment Guidance
-- Focus specifically on treatment options: bisphosphonates, denosumab, radiotherapy, surgery, ablation, radionuclide therapy, chemotherapy, targeted therapy.
-- Explain each option clearly — what it does, who it helps, side effects to be aware of.
-- Always emphasise that treatment decisions must be made with their oncology team.
-- Mention that a multidisciplinary team (oncologist, radiotherapist, pain specialist) gives the best outcomes.`,
+- Focus on: bisphosphonates, denosumab, radiotherapy, surgery, ablation, radionuclide therapy.
+- Explain each option clearly — what it does, who it helps, side effects.
+- Always emphasise decisions must be made with their oncology team.`,
 
     pain: `
 CURRENT MODE: Pain Management & Comfort
 - Focus on practical, actionable advice for managing bone pain.
-- Cover both medical options (analgesics, bisphosphonates, radiotherapy) and non-medical strategies (positioning, heat/cold therapy, gentle movement, sleep hygiene).
-- Be compassionate — bone pain is real and severe, never minimise it.
-- Suggest when to contact their medical team urgently (sudden severe pain, new weakness, numbness).
-- Include mental wellness tips — pain and anxiety are linked.`,
+- Cover both medical options and non-medical strategies.
+- Suggest when to contact their medical team urgently.`,
   };
 
   return base + (modes[mode] || modes.clinical);
@@ -172,8 +175,11 @@ router.post("/chat", async (req, res) => {
     return res.status(400).json({ error: "Message is required." });
   }
 
-  if (!GEMINI_API_KEY) {
-    return res.status(503).json({ error: "Gemini API key not configured." });
+  if (!HF_TOKEN) {
+    return res.status(503).json({
+      error: "HuggingFace token not configured.",
+      hint:  "Add HF_TOKEN to your environment variables.",
+    });
   }
 
   if (!GROQ_API_KEY) {
@@ -188,12 +194,11 @@ router.post("/chat", async (req, res) => {
     });
   }
 
-  // Strip mode prefix from message if present
   const cleanMessage = message.replace(/^\[MODE:[^\]]+\]\s*/, "").trim();
   console.log(`[BONNE] Mode: ${mode} | Query: "${cleanMessage.slice(0, 60)}"`);
 
   try {
-    // 1. Embed with Gemini
+    // 1. Embed with HuggingFace
     const queryVec  = await embedQuery(cleanMessage);
 
     // 2. Retrieve top 5 chunks
@@ -237,7 +242,7 @@ router.get("/chat/status", (req, res) => {
     documents:  store?.documents || [],
     created:    store?.created || null,
     llm:        "Groq llama-3.3-70b-versatile",
-    embeddings: "Gemini gemini-embedding-001",
+    embeddings: `HuggingFace ${HF_EMBED_MODEL}`,
     modes:      ["clinical", "motivational", "treatment", "pain"],
   });
 });
