@@ -1,0 +1,35 @@
+# =============================================================================
+# BoneGuard — .gitignore
+# Place this in E:\boneguard-app\boneguard-app\
+# =============================================================================
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Environment files (NEVER commit these) ───────────────────────────────────
+.env
+.env.local
+.env.production
+.env.development
+
+# ── Next.js ───────────────────────────────────────────────────────────────────
+frontend/.next/
+frontend/out/
+
+# ── Vector store (large binary, regenerate with ingest.js) ───────────────────
+bonne-chatbot/data/vectorstore.json
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/

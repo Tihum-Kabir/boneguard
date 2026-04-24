@@ -1,0 +1,7 @@
+# Add these lines to your existing backend/.env file
+
+# Gemini API key for Bonne chatbot
+GEMINI_API_KEY=AIzaSyD5aDMEczwH1P258Ft-dH3dpCzDrZxkuXk
+
+# Path to the vector store JSON (relative to backend folder)
+VECTORSTORE_PATH=../bonne-chatbot/data/vectorstore.json
