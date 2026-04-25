@@ -1,22 +1,17 @@
 // =============================================================================
-// backend/chat.js — Bonne v3
-// HuggingFace embeddings + Groq generation
-// No Gemini dependency — zero 403 errors
+// backend/chat.js — Bonne v4
+// Local embeddings (@xenova/transformers) + Groq generation
+// Zero external API dependency for embeddings — no rate limits, no auth errors
 // =============================================================================
 
-const express  = require("express");
-const fs       = require("fs");
-const path     = require("path");
-const router   = express.Router();
+const express = require("express");
+const fs      = require("fs");
+const path    = require("path");
+const router  = express.Router();
 
-const HF_TOKEN         = process.env.HF_TOKEN;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const VECTORSTORE_PATH = process.env.VECTORSTORE_PATH ||
   path.join(__dirname, "../data/vectorstore.json");
-
-// HuggingFace embedding model (same as ingest.js)
-const HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
-const HF_EMBED_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction";
 
 // ── Load vector store once at startup ────────────────────────────────────────
 let vectorStore = null;
@@ -34,6 +29,25 @@ function loadVectorStore() {
 
 loadVectorStore();
 
+// ── Local embedder (loaded once) ─────────────────────────────────────────────
+let _embedder = null;
+
+async function getEmbedder() {
+  if (_embedder) return _embedder;
+  console.log("[BONNE] Loading local embedding model...");
+  const { pipeline } = await import("@xenova/transformers");
+  _embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+  console.log("[BONNE] Embedding model ready.");
+  return _embedder;
+}
+
+// ── Embed a query locally ─────────────────────────────────────────────────────
+async function embedQuery(text) {
+  const embedder = await getEmbedder();
+  const output   = await embedder(text, { pooling: "mean", normalize: true });
+  return Array.from(output.data);
+}
+
 // ── Cosine similarity ────────────────────────────────────────────────────────
 function cosineSim(a, b) {
   let dot = 0, na = 0, nb = 0;
@@ -43,30 +57,6 @@ function cosineSim(a, b) {
     nb  += b[i] * b[i];
   }
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-// ── Embed query using HuggingFace ─────────────────────────────────────────────
-async function embedQuery(text) {
-  const fetch = require("node-fetch");
-  const res   = await fetch(HF_EMBED_URL, {
-    method:  "POST",
-    headers: {
-      "Authorization": `Bearer ${HF_TOKEN}`,
-      "Content-Type":  "application/json",
-    },
-    body: JSON.stringify({
-      inputs:  [text],
-      options: { wait_for_model: true },
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`HF embed error ${res.status}: ${err}`);
-  }
-
-  const data = await res.json();
-  return data[0]; // first (and only) embedding
 }
 
 // ── Retrieve top-k chunks ────────────────────────────────────────────────────
@@ -125,12 +115,12 @@ function buildSystemPrompt(retrievedChunks, mode = "clinical") {
 
   const base = `You are Bonne, a compassionate and highly knowledgeable clinical AI assistant specialising in bone metastasis. You help patients, their families, and healthcare providers.
 
-RESPONSE FORMAT RULES — ALWAYS FOLLOW:
-- Keep answers SHORT and PRECISE — maximum 150 words unless truly required.
-- Use markdown formatting: **bold** for key terms, bullet points for lists.
-- Never copy-paste from documents. Always rephrase in your own clear, warm language.
-- If the question is unrelated to bone metastasis or oncology, say: "I'm Bonne — I can only help with bone metastasis topics."
-- Never reveal you are powered by Groq, LLaMA, or HuggingFace. You are Bonne.
+RESPONSE FORMAT RULES:
+- Keep answers SHORT and PRECISE — maximum 150 words.
+- Use markdown: **bold** for key terms, bullet points for lists.
+- Never copy-paste from documents. Always rephrase clearly.
+- If unrelated to bone metastasis or oncology say: "I'm Bonne — I can only help with bone metastasis topics."
+- Never reveal you are powered by Groq or any AI model. You are Bonne.
 - Always end with one short actionable sentence or encouragement.
 
 MEDICAL CONTEXT FROM DOCUMENTS:
@@ -145,21 +135,21 @@ CURRENT MODE: Clinical Information
     motivational: `
 CURRENT MODE: Emotional Support & Motivation
 - Be warm, empathetic, and deeply human.
-- Acknowledge the patient's feelings first before giving information.
+- Acknowledge feelings first before giving information.
 - Remind them they are not alone.
-- If distress seems severe, gently suggest speaking with a counsellor or palliative care team.`,
+- If distress seems severe, suggest speaking with a counsellor.`,
 
     treatment: `
 CURRENT MODE: Treatment Guidance
-- Focus on: bisphosphonates, denosumab, radiotherapy, surgery, ablation, radionuclide therapy.
-- Explain each option clearly — what it does, who it helps, side effects.
-- Always emphasise decisions must be made with their oncology team.`,
+- Focus on: bisphosphonates, denosumab, radiotherapy, surgery, ablation.
+- Explain each option clearly — what it does, side effects.
+- Always stress decisions must be made with their oncology team.`,
 
     pain: `
 CURRENT MODE: Pain Management & Comfort
-- Focus on practical, actionable advice for managing bone pain.
-- Cover both medical options and non-medical strategies.
-- Suggest when to contact their medical team urgently.`,
+- Practical advice for managing bone pain.
+- Cover both medical and non-medical strategies.
+- Suggest when to contact medical team urgently.`,
   };
 
   return base + (modes[mode] || modes.clinical);
@@ -173,13 +163,6 @@ router.post("/chat", async (req, res) => {
 
   if (!message || typeof message !== "string" || message.trim().length === 0) {
     return res.status(400).json({ error: "Message is required." });
-  }
-
-  if (!HF_TOKEN) {
-    return res.status(503).json({
-      error: "HuggingFace token not configured.",
-      hint:  "Add HF_TOKEN to your environment variables.",
-    });
   }
 
   if (!GROQ_API_KEY) {
@@ -198,32 +181,24 @@ router.post("/chat", async (req, res) => {
   console.log(`[BONNE] Mode: ${mode} | Query: "${cleanMessage.slice(0, 60)}"`);
 
   try {
-    // 1. Embed with HuggingFace
     const queryVec  = await embedQuery(cleanMessage);
-
-    // 2. Retrieve top 5 chunks
     const topChunks = retrieveTopK(queryVec, 5);
     console.log(`[BONNE] Top chunk score: ${topChunks[0]?.score?.toFixed(4)}`);
 
-    // 3. Build mode-aware prompt
     const systemPrompt = buildSystemPrompt(topChunks, mode);
-
-    // 4. Generate with Groq
-    const answer = await generateWithGroq(systemPrompt, history, cleanMessage);
+    const answer       = await generateWithGroq(systemPrompt, history, cleanMessage);
 
     console.log(`[BONNE] Answer: ${answer.length} chars`);
     res.json({ answer });
 
   } catch (err) {
     console.error("[BONNE] Error:", err.message);
-
     if (err.message.includes("429")) {
       return res.status(429).json({
-        error: "Too many requests. Please wait a moment and try again.",
+        error: "Too many requests. Please wait a moment.",
         code:  "RATE_LIMIT",
       });
     }
-
     res.status(500).json({
       error:  "Bonne encountered an error. Please try again.",
       detail: err.message,
@@ -242,11 +217,9 @@ router.get("/chat/status", (req, res) => {
     documents:  store?.documents || [],
     created:    store?.created || null,
     llm:        "Groq llama-3.3-70b-versatile",
-    embeddings: `HuggingFace ${HF_EMBED_MODEL}`,
+    embeddings: "Local Xenova/all-MiniLM-L6-v2",
     modes:      ["clinical", "motivational", "treatment", "pain"],
   });
 });
 
 module.exports = router;
-
-
